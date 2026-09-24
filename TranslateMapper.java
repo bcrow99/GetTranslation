@@ -874,15 +874,46 @@ public class TranslateMapper
      * anything bigger, see getRefinedTranslation() below, which pyramids
      * a window down until this precondition holds and calls this.
      *
-     * dest[0] is a status code: 0 = zero increment on the first pass
-     * (images already matched); 1 = converged (increment fell under 1% of
-     * the initial increment); 2 = stopped, increment reversed direction
-     * between internal iterations; 3 = didn't converge within the
-     * internal iteration limit; 4 = stopped, translation reached
-     * translate()'s +/-1 boundary; 5 = stopped, the local gradient
-     * structure was too degenerate (singular or near-singular) to resolve
-     * an increment at all -- see solveIncrement()'s comment. dest[1]/
-     * dest[2] are the x/y estimate.
+     * dest[0] is a status code:
+     *
+     *   0 = zero increment on the first pass (images already matched).
+     *   1 = converged (increment fell under 1% of the initial increment).
+     *   2 = didn't converge within the internal iteration limit. Not
+     *       necessarily a failure -- it means this call alone was
+     *       inconclusive, and a caller may still be able to get a real
+     *       answer out of the same underlying data by asking again with
+     *       more resolution (less pyramid shrinking) or, if it controls
+     *       that knob, more iterations; this method's own iteration cap is
+     *       fixed and isn't one of its parameters.
+     *   3 = stopped, the local gradient structure was too degenerate
+     *       (singular or near-singular) to resolve an increment at all --
+     *       see solveIncrement()'s comment. Also not necessarily a dead
+     *       end: degeneracy (a flat or single-orientation patch) is often a
+     *       resolution artifact -- heavier pyramid shrinking washes out
+     *       exactly the detail that would have made the normal equations
+     *       solvable -- so a caller may recover a real estimate simply by
+     *       trying again with less shrinking.
+     *   4 = stopped, only the X estimate reached translate()'s +/-1
+     *       boundary.
+     *   5 = stopped, only the Y estimate reached translate()'s +/-1
+     *       boundary.
+     *   6 = stopped, both X and Y reached translate()'s +/-1 boundary.
+     *       4/5/6 are likewise an expected, not-a-failure outcome in
+     *       general -- this method only ever resolves SUBPIXEL offsets (see
+     *       above), so a genuine shift bigger than that will legitimately
+     *       hit this boundary, and it's exactly the signal an unhinted,
+     *       coarse-to-fine caller uses to know it needs to shrink further
+     *       before trying again; it can still end in a successful overall
+     *       result once enough shrinking brings the true shift back under a
+     *       pixel. Boundary detection is per axis because each axis is
+     *       checked independently (xtranslation >= 1. || xtranslation <= -1.,
+     *       same for ytranslation -- see the BUG FIX note below for why
+     *       both directions are checked now, not just the upper bound) --
+     *       so a caller
+     *       reducing shrinking per-axis (rather than by one shared amount)
+     *       knows exactly which axis actually needs it.
+     *
+     * dest[1]/dest[2] are the x/y estimate.
      *
      * BUG FIX (found from a real crash report, not from this file's own
      * testing): a perfectly flat patch, or one whose gradients all point
@@ -909,24 +940,55 @@ public class TranslateMapper
      * there. Fixed by solveIncrement() below, used at both computation
      * sites in this method: it detects the singular/near-singular case
      * before dividing and returns null instead of NaN, and both call sites
-     * now stop cleanly (status 5, translation held at whatever was already
+     * now stop cleanly (status 3, translation held at whatever was already
      * accumulated) rather than injecting NaN into an accumulator that has
      * no way to recover from it.
      *
-     * KNOWN ISSUE, not fixed here: dest[0]==2 can never actually be
-     * returned as written -- previous_xincrement/previous_yincrement are
-     * overwritten with THIS iteration's own xincrement/yincrement
-     * immediately before the reversal comparison below runs, so that
-     * comparison is always value-vs-itself and the reversal branch is
-     * dead code. Found while investigating a confidence-weighted
-     * alternative to refineOuterRounds()'s round-keeping rule (see that
-     * method's own history for why) -- fixing it turned out not to help
-     * that effort (see there for why), so the fix wasn't kept here, but
-     * it's a real, harmless-so-far latent bug: nothing downstream of this
-     * method currently reads dest[0] (refineWithinWindow() only ever
-     * reads dest[1]/dest[2]), so it has had no effect on any of this
-     * file's tested numeric results. Worth fixing on its own merits if
-     * this status code is ever relied on for anything.
+     * BUG FIX (found empirically while testing ShiftDetector's chained
+     * getShiftRefined() against equal-magnitude positive vs. negative
+     * shifts): the boundary check used to read
+     * "xtranslation >= 1. || ytranslation >= 1." -- upper bound only, a
+     * known, long-flagged asymmetry that had been left as "not fixed here"
+     * through several rounds of status-code cleanup. It turns out that
+     * silence was hiding a real, measurable problem rather than a merely
+     * cosmetic one: on a true shift of -6.3 (vs. +6.3 on the same image
+     * pair), the +6.3 case correctly tripped this check almost immediately
+     * (status 6 at full resolution, the exact signal a coarse-to-fine
+     * caller needs to know to shrink further), while the -6.3 case never
+     * tripped it at all -- xtranslation walked straight past -1, -2, -3
+     * and beyond with every iteration re-calling
+     * translate(source2, xtranslation, ytranslation) further and further
+     * outside translate()'s own documented "-1 to 1" domain, extrapolating
+     * on increasingly meaningless samples, until the iteration cap was hit
+     * and status 2 was returned holding whatever garbage that extrapolation
+     * had produced (roughly -9.3 for a true -6.3 shift, on the pair that
+     * surfaced this). Fixed by checking both directions per axis
+     * (xtranslation >= 1. || xtranslation <= -1., same for ytranslation),
+     * so a negative-going crossing now reports status 4/5/6 -- the same
+     * "shrink further and try again" signal a positive one always did --
+     * instead of silently degrading into exactly the kind of
+     * out-of-domain extrapolation this method's own boundary check exists
+     * to prevent.
+     *
+     * REMOVED, not just renumbered: an earlier status (previously numbered
+     * 2) reported an increment that reversed direction between internal
+     * iterations. It could never actually be returned as written --
+     * previous_xincrement/previous_yincrement were overwritten with THAT
+     * SAME iteration's own xincrement/yincrement immediately before the
+     * reversal comparison ran, so the comparison was always value-vs-itself
+     * and the branch was dead code. Found while investigating a
+     * confidence-weighted alternative to refineOuterRounds()'s
+     * round-keeping rule (see that method's own history for why) --
+     * fixing it turned out not to help that effort (see there for why), so
+     * it was left in place at the time, since nothing downstream of this
+     * method read dest[0] anyway (refineWithinWindow() only ever read
+     * dest[1]/dest[2]). Now that dest[0] IS relied on (by ShiftDetector, in
+     * particular, for exactly this kind of per-status branching), an
+     * unreachable branch is worse than a harmless one, so it -- and the
+     * previous_xincrement/previous_yincrement variables that existed only
+     * to feed it -- were deleted outright rather than fixed: removing an
+     * always-false branch changes no observable behavior, and there was no
+     * evidence the reversal check was a meaningful signal worth resurrecting.
      */
 
     /**
@@ -997,7 +1059,7 @@ public class TranslateMapper
         double[] initialIncrement = solveIncrement(w, x, z, b1, b2);
         if (initialIncrement == null)
         {
-            dest[0] = 5; dest[1] = 0; dest[2] = 0;
+            dest[0] = 3; dest[1] = 0; dest[2] = 0;
             return dest;
         }
         double xincrement = initialIncrement[0];
@@ -1012,8 +1074,6 @@ public class TranslateMapper
         double xincrement_min = Math.abs(xincrement) / 100.;
         double yincrement_min = Math.abs(yincrement) / 100.;
 
-        double previous_xincrement = xincrement;
-        double previous_yincrement = yincrement;
         double xtranslation        = xincrement;
         double ytranslation        = yincrement;
 
@@ -1036,30 +1096,25 @@ public class TranslateMapper
             double[] increment = solveIncrement(w, x, z, b1, b2);
             if (increment == null)
             {
-                dest[0] = 5; dest[1] = xtranslation; dest[2] = ytranslation;
+                dest[0] = 3; dest[1] = xtranslation; dest[2] = ytranslation;
                 return dest;
             }
             xincrement          = increment[0];
             xtranslation       += xincrement;
-            previous_xincrement = xincrement;
             yincrement          = increment[1];
             ytranslation       += yincrement;
-            previous_yincrement = yincrement;
 
             if(Math.abs(xincrement) < xincrement_min || Math.abs(yincrement) < yincrement_min)
             {
                 dest[0] = 1; dest[1] = xtranslation; dest[2] = ytranslation;
                 return dest;
             }
-            else if((xincrement < 0 && previous_xincrement > 0) || (xincrement > 0 && previous_xincrement < 0)
-            || (yincrement < 0 && previous_yincrement > 0) || (yincrement > 0 && previous_yincrement < 0))
+            else if(xtranslation >= 1. || xtranslation <= -1. || ytranslation >= 1. || ytranslation <= -1.)
             {
-                dest[0] = 2; dest[1] = xtranslation; dest[2] = ytranslation;
-                return (dest);
-            }
-            else if(xtranslation >= 1. || ytranslation >= 1.)
-            {
-                dest[0] = 4; dest[1] = xtranslation; dest[2] = ytranslation;
+                boolean xCrossed = (xtranslation >= 1. || xtranslation <= -1.);
+                boolean yCrossed = (ytranslation >= 1. || ytranslation <= -1.);
+                dest[0] = (xCrossed && yCrossed) ? 6 : (xCrossed ? 4 : 5);
+                dest[1] = xtranslation; dest[2] = ytranslation;
                 return (dest);
             }
             else
@@ -1068,7 +1123,7 @@ public class TranslateMapper
                 current_number_of_estimates++;
             }
         }
-        dest[0] = 3; dest[1] = xtranslation; dest[2] = ytranslation;
+        dest[0] = 2; dest[1] = xtranslation; dest[2] = ytranslation;
         return dest;
     }
 
@@ -1560,9 +1615,12 @@ public class TranslateMapper
      * round 0 got eroded by later, genuinely-reversed-direction rounds
      * (0.23px total error under hard-stop vs 0.91px letting everything
      * through). Reverted on that evidence: getTranslation()'s own status
-     * code, even after fixing the dead dest[0]==2 branch documented in
-     * its own comment, isn't a reliable proxy for round trustworthiness
-     * in this pipeline, and the one genuinely diagnostic signal (a
+     * code, even after fixing the dead reversal-detection branch that used
+     * to be numbered dest[0]==2 (since removed outright, along with the
+     * status number, rather than fixed -- see getTranslation()'s own
+     * comment; the status numbering referenced throughout this historical
+     * note predates that renumbering), isn't a reliable proxy for round
+     * trustworthiness in this pipeline, and the one genuinely diagnostic signal (a
      * reversed Newton iteration) is too rare on real photo data to carry
      * a combination rule by itself. Combined with the three independent-
      * estimate-averaging ideas above, that's four different approaches to
@@ -1808,5 +1866,107 @@ public class TranslateMapper
         }
 
         return new double[] { totalDx, totalDy };
+    }
+
+    // =========================================================================
+    // bilateralSmooth() / anisotropicSmooth() -- extracted from DeltaMapper.java,
+    // for use by ImageTranslater's Smooth sliders. Both operate on a flat
+    // single-channel int[] with threshold==0 as a documented no-op.
+    // =========================================================================
+
+    // Bilateral smoothing preserves edges, suppresses noise.
+    // threshold 0 = no-op; 1-10 maps range sigma 10-100.
+    public static int[] bilateralSmooth(int[] src, int xdim, int ydim, int threshold)
+    {
+        if (threshold == 0) return src.clone();
+
+        double sigma_r = threshold * threshold;  // quadratic: 1,4,9,16,25 for threshold 1-5
+        double sigma_s = 1.5;                // spatial sigma (fixed, 5x5 kernel)
+        int    radius  = 2;
+
+        // Range weight lookup: indexed by absolute intensity difference 0-255
+        double[] rw = new double[256];
+        double   r2 = 2.0 * sigma_r * sigma_r;
+        for (int d = 0; d < 256; d++) rw[d] = Math.exp(-(d * d) / r2);
+
+        // Spatial weight kernel
+        int    ksize = 2 * radius + 1;
+        double[][]  sw = new double[ksize][ksize];
+        double s2 = 2.0 * sigma_s * sigma_s;
+        for (int dy = -radius; dy <= radius; dy++)
+            for (int dx = -radius; dx <= radius; dx++)
+                sw[dy + radius][dx + radius] = Math.exp(-(dx * dx + dy * dy) / s2);
+
+        int[] dst = new int[src.length];
+        for (int row = 0; row < ydim; row++)
+        {
+            for (int col = 0; col < xdim; col++)
+            {
+                int    center = src[row * xdim + col];
+                double sum_w  = 0.0, sum_v = 0.0;
+                for (int dy = -radius; dy <= radius; dy++)
+                {
+                    int ny = row + dy;
+                    if (ny < 0 || ny >= ydim) continue;
+                    for (int dx = -radius; dx <= radius; dx++)
+                    {
+                        int nx = col + dx;
+                        if (nx < 0 || nx >= xdim) continue;
+                        int    v = src[ny * xdim + nx];
+                        double w = sw[dy + radius][dx + radius] * rw[Math.abs(v - center)];
+                        sum_w += w; sum_v += w * v;
+                    }
+                }
+                dst[row * xdim + col] = (int) Math.round(sum_v / sum_w);
+            }
+        }
+        return dst;
+    }
+
+    // Anisotropic diffusion (Perona-Malik) iterative edge-preserving smooth.
+    // threshold 0 = no-op; iterations = threshold, K = threshold*3+5 (8-35).
+    // lambda = 0.25 (stability limit for 4-directional scheme).
+    public static int[] anisotropicSmooth(int[] src, int xdim, int ydim, int threshold)
+    {
+        if (threshold == 0) return src.clone();
+
+        int    iterations = threshold;
+        double K2         = (threshold * 3.0 + 5.0) * (threshold * 3.0 + 5.0);
+        double lambda     = 0.25;
+
+        // Conductance lookup: c[d+255] = exp(-d^2/K^2) for d in [-255,255]
+        double[] c = new double[511];
+        for (int d = -255; d <= 255; d++) c[d + 255] = Math.exp(-(d * d) / K2);
+
+        double[] img  = new double[src.length];
+        double[] next = new double[src.length];
+        for (int i = 0; i < src.length; i++) img[i] = src[i];
+
+        for (int iter = 0; iter < iterations; iter++)
+        {
+            for (int row = 0; row < ydim; row++)
+            {
+                for (int col = 0; col < xdim; col++)
+                {
+                    int    k  = row * xdim + col;
+                    double v  = img[k];
+                    double dN = (row > 0)        ? img[k - xdim] - v : 0;
+                    double dS = (row < ydim - 1) ? img[k + xdim] - v : 0;
+                    double dE = (col < xdim - 1) ? img[k + 1]    - v : 0;
+                    double dW = (col > 0)        ? img[k - 1]    - v : 0;
+                    int iN = Math.max(0, Math.min(510, (int)(dN + 255.5)));
+                    int iS = Math.max(0, Math.min(510, (int)(dS + 255.5)));
+                    int iE = Math.max(0, Math.min(510, (int)(dE + 255.5)));
+                    int iW = Math.max(0, Math.min(510, (int)(dW + 255.5)));
+                    next[k] = v + lambda * (c[iN]*dN + c[iS]*dS + c[iE]*dE + c[iW]*dW);
+                }
+            }
+            double[] tmp = img; img = next; next = tmp;
+        }
+
+        int[] dst = new int[src.length];
+        for (int i = 0; i < src.length; i++)
+            dst[i] = Math.max(0, Math.min(255, (int) Math.round(img[i])));
+        return dst;
     }
 }
